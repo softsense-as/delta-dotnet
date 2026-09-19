@@ -13,7 +13,9 @@
   </PropertyGroup>
 
   <!-- Source Link + symbol packages (softsense-publish-packages skill). IncludeSymbols,
-       snupkg and PublishRepositoryUrl already come from DeltaLake.csproj. -->
+       snupkg and PublishRepositoryUrl already come from DeltaLake.csproj. The SDK (8+) ships
+       Source Link for GitHub built in, so no Microsoft.SourceLink.GitHub reference: the 8.0.0
+       package pulls in Microsoft.Build.Tasks.Git 8.0.0 (GHSA-23fw-v26w-5fgq, no 8.x fix). -->
   <PropertyGroup>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <!-- CI-only: deterministic build + commit-pinned Source Link. -->
@@ -40,8 +42,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- PrivateAssets=All: build-only, never a transitive dependency of the shipped package. -->
-    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
     <PackageReference Include="Microsoft.VisualStudio.Threading.Analyzers" Version="17.4.33"
       PrivateAssets="all" />
     <PackageReference Include="Microsoft.CodeAnalysis.NetAnalyzers" Version="9.0.0">
