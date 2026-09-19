@@ -23,3 +23,8 @@ tests/data/simple_table_with_no_checkpoint_2/
 TestResults/
 lcov.info
 coveragereport
+
+# Claude Code: skills synced from the SoftSense skill server (softsense-skills-sync), local settings
+.claude/skills/softsense-*/
+.claude/skills/.softsense-sync.json
+.claude/settings.local.json

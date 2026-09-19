@@ -5,11 +5,21 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <Nullable>enable</Nullable>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/mightyshazam/delta-dotnet</RepositoryUrl>
+    <RepositoryUrl>https://github.com/softsense-as/delta-dotnet</RepositoryUrl>
     <ProduceReferenceAssembly>True</ProduceReferenceAssembly>
     <UNSAFE_BYTEBUFFER>true</UNSAFE_BYTEBUFFER>
     <ENABLE_SPAN_T>true</ENABLE_SPAN_T>
     <BYTEBUFFER_NO_BOUNDS_CHECK>true</BYTEBUFFER_NO_BOUNDS_CHECK>
+  </PropertyGroup>
+
+  <!-- Source Link + symbol packages (softsense-publish-packages skill). IncludeSymbols,
+       snupkg and PublishRepositoryUrl already come from DeltaLake.csproj. The SDK (8+) ships
+       Source Link for GitHub built in, so no Microsoft.SourceLink.GitHub reference: the 8.0.0
+       package pulls in Microsoft.Build.Tasks.Git 8.0.0 (GHSA-23fw-v26w-5fgq, no 8.x fix). -->
+  <PropertyGroup>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <!-- CI-only: deterministic build + commit-pinned Source Link. -->
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
   <PropertyGroup>
