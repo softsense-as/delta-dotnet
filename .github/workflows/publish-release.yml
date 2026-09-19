@@ -1,0 +1,153 @@
+# The RELEASE train (softsense-publish-packages skill, pure-library pattern), adapted for this
+# fork the same way as publish-preview.yml: src/version.txt, natives from build-natives.yml,
+# no test step (build.yml covers it).
+#
+# Manually dispatched only. Publishes the STABLE X.Y.Z from src/version.txt to GitHub Packages,
+# prints release notes + a summary to the run, and tags production/X.Y.Z.
+# Guard: production/{version.txt} must NOT already exist. The manual dispatch IS the approval.
+# After a release, bump src/version.txt on main (the preview `ahead` guard fails until you do).
+
+name: Publish Release NuGet Packages
+
+on:
+  workflow_dispatch:
+
+env:
+  NUGET_SOURCE: "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+
+permissions:
+  contents: write # push the production/X.Y.Z tag
+  packages: write # publish the stable NuGet packages
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Guard — version.txt must not already be released
+        run: bash .github/scripts/guard-version.sh unreleased
+
+  natives:
+    needs: guard
+    uses: ./.github/workflows/build-natives.yml
+
+  pack-release:
+    needs: natives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+          fetch-depth: 0 # full history + tags for the release notes and the tag push
+
+      - name: Checkout specific delta-kernel-rs release
+        shell: bash
+        run: chmod -R +x .scripts/*.sh && .scripts/checkout-delta-kernel-rs.sh
+
+      - name: Download native libraries
+        uses: actions/download-artifact@v5
+        with:
+          path: rust-libraries
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            9.0.x
+            10.0.x
+
+      - name: Determine release version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(tr -d '[:space:]' < src/version.txt)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+
+      # Release notes = commits since the previous production/* release. Computed BEFORE tagging.
+      - name: Build release notes
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          LAST=$(git tag -l 'production/*' --sort=-v:refname | head -1 | sed 's#production/##')
+          if [ -n "$LAST" ]; then RANGE="production/$LAST..HEAD"; SINCE="production/$LAST"; else RANGE="HEAD"; SINCE="(first release)"; fi
+          {
+            echo "## Release production/$VERSION"
+            echo ""
+            echo "- Built-from ref: \`${{ github.ref_name }}\`   ·   Previous release: \`$SINCE\`"
+            echo ""
+            echo "### Changes since $SINCE"
+            git log $RANGE --pretty=format:'- %h %s (%an)' 2>/dev/null || echo "- (none)"
+            echo ""
+          } > release-notes.md
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pack release packages
+        shell: pwsh
+        run: >-
+          ./src/Scripts/publish-nuget-packages.ps1
+          -Version "${{ steps.version.outputs.version }}"
+          -OutputPath "${{ runner.temp }}/packages"
+          -RustLibraryRoot "${{ github.workspace }}/rust-libraries"
+          -KernelLibraryRoot "${{ github.workspace }}/rust-libraries"
+
+      # Push each package INDIVIDUALLY: one failure is reported per-package AND fails the job, so a
+      # partial release never reports success (and the tag step below is skipped, so a
+      # half-published version is never tagged production/X.Y.Z).
+      - name: Push release packages to GitHub Packages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s nullglob
+          pkgs=("$RUNNER_TEMP/packages/"*.nupkg)
+          [ ${#pkgs[@]} -gt 0 ] || { echo "::error::no packages were produced"; exit 1; }
+          echo "### Publish results (${#pkgs[@]})" >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for pkg in "${pkgs[@]}"; do
+            name=$(basename "$pkg")
+            if dotnet nuget push "$pkg" --source "$NUGET_SOURCE" --api-key "$GH_TOKEN" --skip-duplicate; then
+              echo "- ✅ \`$name\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- ❌ \`$name\` — push failed" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ] || { echo "::error::one or more packages failed to publish — the release is NOT tagged"; exit 1; }
+
+      - name: Tag production/${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "production/$VERSION" -m "Release $VERSION"
+          git push origin "production/$VERSION"
+
+      - name: Upload release notes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.version }}
+          path: release-notes.md
+          if-no-files-found: ignore
+
+      - name: Run summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Version | \`${{ steps.version.outputs.version }}\` |"
+            echo "| Feed | GitHub Packages |"
+            echo "| Built-from ref | \`${{ github.ref_name }}\` |"
+            echo "| Result | ${{ job.status == 'success' && '✅ released + tagged' || '❌ failed — not released' }} |"
+            echo ""
+            echo "Next: bump \`src/version.txt\` on main — the preview \`ahead\` guard fails until you do."
+          } >> "$GITHUB_STEP_SUMMARY"

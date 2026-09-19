@@ -1,0 +1,145 @@
+# The PREVIEW train (softsense-publish-packages skill, pure-library pattern), adapted for a fork
+# of delta-incubator/delta-dotnet:
+#   - src/version.txt is the version source (this repo uses src/, not Source/). Its base is the
+#     upstream release this fork is built on (Directory.Build.props <Version>), so a consumer can
+#     read which upstream line a SoftSense.DeltaLake.Net version tracks. Bump it past upstream's
+#     when the fork moves ahead on its own.
+#   - The package bundles Rust natives for five RIDs, built by build-natives.yml (reusable) and
+#     handed to dotnet pack via RustLibraryRoot / KernelLibraryRoot.
+#   - No test step here: build.yml already builds and tests on push + PR to main. Testing inside
+#     the pack job is not possible, since the prebuilt-natives mode does not copy natives into
+#     the test output.
+#
+# Builds on every push to main and every PR; publishes {version.txt}-preview.{run} to GitHub
+# Packages on push to main only (PRs pack to validate packaging but do NOT publish).
+# Guard: version.txt must be strictly SemVer-ahead of the latest production/* release.
+
+name: Publish Preview NuGet Packages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  NUGET_SOURCE: "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # version.txt is the source of truth; keep it strictly ahead of the latest prod release.
+      - name: Guard — version.txt must be ahead of the latest prod release
+        run: bash .github/scripts/guard-version.sh ahead
+
+  natives:
+    needs: guard
+    uses: ./.github/workflows/build-natives.yml
+
+  pack-publish:
+    needs: natives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - name: Checkout specific delta-kernel-rs release
+        shell: bash
+        run: chmod -R +x .scripts/*.sh && .scripts/checkout-delta-kernel-rs.sh
+
+      - name: Download native libraries
+        uses: actions/download-artifact@v5
+        with:
+          path: rust-libraries
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            9.0.x
+            10.0.x
+
+      - name: Determine preview version
+        id: version
+        shell: bash
+        run: |
+          BASE=$(tr -d '[:space:]' < src/version.txt)
+          echo "version=${BASE}-preview.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "Preview version: ${BASE}-preview.${{ github.run_number }}"
+
+      # Pack on every run (PRs too) so a packaging break fails the PR, not a later publish.
+      - name: Pack preview packages
+        shell: pwsh
+        run: >-
+          ./src/Scripts/publish-nuget-packages.ps1
+          -Version "${{ steps.version.outputs.version }}"
+          -OutputPath "${{ runner.temp }}/packages"
+          -RustLibraryRoot "${{ github.workspace }}/rust-libraries"
+          -KernelLibraryRoot "${{ github.workspace }}/rust-libraries"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-${{ steps.version.outputs.version }}
+          path: |
+            ${{ runner.temp }}/packages/*.nupkg
+            ${{ runner.temp }}/packages/*.snupkg
+
+      # Publish only from main — never from a PR. Push each package INDIVIDUALLY so one failure
+      # is reported per-package AND fails the job. A partial publish must never report success.
+      - name: Push preview packages to GitHub Packages
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s nullglob
+          pkgs=("$RUNNER_TEMP/packages/"*.nupkg)
+          [ ${#pkgs[@]} -gt 0 ] || { echo "::error::no packages were produced"; exit 1; }
+          {
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Version | \`${{ steps.version.outputs.version }}\` |"
+            echo "| Event | \`push\` — publishing to GitHub Packages |"
+            echo ""
+            echo "### Publish results (${#pkgs[@]})"
+          } >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for pkg in "${pkgs[@]}"; do
+            name=$(basename "$pkg")
+            if dotnet nuget push "$pkg" --source "$NUGET_SOURCE" --api-key "$GH_TOKEN" --skip-duplicate; then
+              echo "- ✅ \`$name\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- ❌ \`$name\` — push failed" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ] || { echo "::error::one or more packages failed to publish — see the run summary"; exit 1; }
+
+      - name: Packaging summary (PR — packed, not published)
+        if: github.event_name != 'push'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          pkgs=("$RUNNER_TEMP/packages/"*.nupkg)
+          {
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Version | \`${{ steps.version.outputs.version }}\` |"
+            echo "| Event | \`pull_request\` — packed only, not published |"
+            echo ""
+            echo "### Packed (${#pkgs[@]})"
+            if [ ${#pkgs[@]} -eq 0 ]; then echo "- (none)"; fi
+            for f in "${pkgs[@]}"; do echo "- 📦 \`$(basename "$f")\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"

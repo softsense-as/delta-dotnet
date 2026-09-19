@@ -5,11 +5,19 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <Nullable>enable</Nullable>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/mightyshazam/delta-dotnet</RepositoryUrl>
+    <RepositoryUrl>https://github.com/softsense-as/delta-dotnet</RepositoryUrl>
     <ProduceReferenceAssembly>True</ProduceReferenceAssembly>
     <UNSAFE_BYTEBUFFER>true</UNSAFE_BYTEBUFFER>
     <ENABLE_SPAN_T>true</ENABLE_SPAN_T>
     <BYTEBUFFER_NO_BOUNDS_CHECK>true</BYTEBUFFER_NO_BOUNDS_CHECK>
+  </PropertyGroup>
+
+  <!-- Source Link + symbol packages (softsense-publish-packages skill). IncludeSymbols,
+       snupkg and PublishRepositoryUrl already come from DeltaLake.csproj. -->
+  <PropertyGroup>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <!-- CI-only: deterministic build + commit-pinned Source Link. -->
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -32,6 +40,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- PrivateAssets=All: build-only, never a transitive dependency of the shipped package. -->
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
     <PackageReference Include="Microsoft.VisualStudio.Threading.Analyzers" Version="17.4.33"
       PrivateAssets="all" />
     <PackageReference Include="Microsoft.CodeAnalysis.NetAnalyzers" Version="9.0.0">
