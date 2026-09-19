@@ -238,6 +238,51 @@ namespace DeltaLake.Bridge
             return await InsertAsync(stream, options, cancellationToken).ConfigureAwait(false);
         }
 
+        private sealed class InsertCallbackState
+        {
+            public InsertCallbackState(TaskCompletionSource<string> source, ICancellationToken cancellationToken, IntPtr runtime)
+            {
+                Source = source;
+                CancellationToken = cancellationToken;
+                Runtime = runtime;
+            }
+
+            public TaskCompletionSource<string> Source { get; }
+
+            public ICancellationToken CancellationToken { get; }
+
+            public IntPtr Runtime { get; }
+        }
+
+        // ONE process-wide native thunk for insert completion. Marshalling a fresh
+        // closure-capturing delegate on every call mints a new reverse-P/Invoke stub plus
+        // call-counting/tiering metadata in the runtime each time — on a hot path (one
+        // insert per commit) that is a steady, never-reclaimed leak. Per-call state travels
+        // through the bridge's callback_state pointer instead of a closure.
+        private static readonly unsafe Interop.GenericErrorWithStateCallback InsertCompletionDelegate = InsertCompleted;
+        private static readonly IntPtr InsertCompletionCallback = Marshal.GetFunctionPointerForDelegate(InsertCompletionDelegate);
+
+        private static unsafe void InsertCompleted(void* state, void* success, Interop.DeltaTableError* fail)
+        {
+            var handle = GCHandle.FromIntPtr((IntPtr)state);
+            var callState = (InsertCallbackState)handle.Target!;
+            handle.Free();
+            if (callState.CancellationToken.IsCancellationRequested)
+            {
+                callState.Source.TrySetCanceled(callState.CancellationToken);
+                return;
+            }
+
+            if (fail != null)
+            {
+                callState.Source.TrySetException(DeltaRuntimeException.FromDeltaTableError((Interop.Runtime*)callState.Runtime, fail));
+            }
+            else
+            {
+                callState.Source.TrySetResult("{}");
+            }
+        }
+
         internal virtual async Task<string> InsertAsync(
             IArrowArrayStream stream,
             InsertOptions options,
@@ -255,6 +300,10 @@ namespace DeltaLake.Bridge
                     try
                     {
                         CArrowArrayStreamExporter.ExportArrayStream(stream, ffiStream);
+                        // Freed exactly once by InsertCompleted — every native path (success,
+                        // error, cancellation) invokes the callback exactly once.
+                        var callbackState = GCHandle.Alloc(
+                            new InsertCallbackState(tsc, cancellationToken, (IntPtr)_runtime.Ptr));
                         Interop.Methods.table_insert(
                             _runtime.Ptr,
                              _ptr,
@@ -264,23 +313,8 @@ namespace DeltaLake.Bridge
                              new UIntPtr(options.MaxRowsPerGroup),
                              (byte)(options.OverwriteSchema ? 1 : 0),
                             scope.CancellationToken(cancellationToken),
-                              scope.FunctionPointer<Interop.GenericErrorCallback>((success, fail) =>
-                        {
-                            if (cancellationToken.IsCancellationRequested)
-                            {
-                                tsc.TrySetCanceled(cancellationToken);
-                                return;
-                            }
-
-                            if (fail != null)
-                            {
-                                tsc.TrySetException(DeltaRuntimeException.FromDeltaTableError(_runtime.Ptr, fail));
-                            }
-                            else
-                            {
-                                tsc.TrySetResult("{}");
-                            }
-                        }));
+                            (void*)GCHandle.ToIntPtr(callbackState),
+                            InsertCompletionCallback);
                     }
                     finally
                     {

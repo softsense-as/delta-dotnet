@@ -240,3 +240,21 @@ trait ChainingExtensions {
 }
 
 impl<T> ChainingExtensions for T {}
+
+/// Return freed-but-retained allocator memory to the OS (glibc only).
+///
+/// Commit and (especially) checkpoint processing allocate large transient buffers on the
+/// runtime's threads; glibc grows its arenas to satisfy the burst and keeps the freed pages
+/// cached indefinitely (only the top of the main arena is ever auto-trimmed), so a
+/// long-lived engine's RSS ratchets up at every checkpoint even though the memory is free.
+/// Called on the periodic state-refresh cadence — right after the burst, where one cheap
+/// trim releases the whole spike. Deliberately a no-op elsewhere: macOS malloc does not
+/// exhibit the arena-retention pathology, and `malloc_zone_pressure_relief` measured
+/// counterproductive there (steady-state retention 7.1 → 11.1 KB/commit in the repro).
+pub(crate) fn release_retained_allocator_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        // Walks all arenas and MADV_DONTNEEDs page-sized free spans (glibc >= 2.8).
+        libc::malloc_trim(0);
+    }
+}

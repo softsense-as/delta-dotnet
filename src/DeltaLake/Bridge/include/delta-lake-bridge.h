@@ -162,6 +162,18 @@ typedef struct ProtocolResponse {
   const struct DeltaTableError *error;
 } ProtocolResponse;
 
+/**
+ * Like [`GenericErrorCallback`], but the caller's opaque `state` pointer is passed back on
+ * completion. This lets managed callers register ONE process-wide static callback and route
+ * per-call completion state through `state`, instead of marshalling a fresh
+ * closure-capturing delegate — and with it a fresh native thunk plus tiering/call-counting
+ * runtime metadata — on every call. On a hot path (one insert per commit) those per-call
+ * stubs are a measurable, never-reclaimed leak in the managed runtime.
+ */
+typedef void (*GenericErrorWithStateCallback)(const void *state,
+                                              const void *success,
+                                              const struct DeltaTableError *fail);
+
 typedef struct GenericOrError {
   const void *bytes;
   const struct DeltaTableError *error;
@@ -388,7 +400,8 @@ void table_insert(struct Runtime *_Nonnull runtime,
                   uintptr_t max_rows_per_group,
                   bool overwrite_schema,
                   const struct CancellationToken *cancellation_token,
-                  GenericErrorCallback callback);
+                  const void *callback_state,
+                  GenericErrorWithStateCallback callback);
 
 /**
  * Must free the error
