@@ -98,6 +98,10 @@ macro_rules! run_async_with_cancellation {
 
 pub struct RawDeltaTable {
     table: deltalake::DeltaTable,
+    /// Commits performed through this handle since the in-memory state was last rebuilt.
+    /// The post-commit table state accretes per version and is never compacted in place;
+    /// see the periodic refresh in `table_insert`.
+    commits_since_state_refresh: u32,
 }
 
 #[repr(C)]
@@ -279,6 +283,18 @@ type TableEmptyCallback = unsafe extern "C" fn(fail: *const DeltaTableError);
 
 type GenericErrorCallback =
     unsafe extern "C" fn(success: *const c_void, fail: *const DeltaTableError);
+
+/// Like [`GenericErrorCallback`], but the caller's opaque `state` pointer is passed back on
+/// completion. This lets managed callers register ONE process-wide static callback and route
+/// per-call completion state through `state`, instead of marshalling a fresh
+/// closure-capturing delegate — and with it a fresh native thunk plus tiering/call-counting
+/// runtime metadata — on every call. On a hot path (one insert per commit) those per-call
+/// stubs are a measurable, never-reclaimed leak in the managed runtime.
+type GenericErrorWithStateCallback = unsafe extern "C" fn(
+    state: *const c_void,
+    success: *const c_void,
+    fail: *const DeltaTableError,
+);
 
 #[no_mangle]
 pub extern "C" fn table_uri(table: NonNull<RawDeltaTable>) -> *mut ByteArray {
@@ -1225,13 +1241,17 @@ pub extern "C" fn table_insert(
     max_rows_per_group: usize,
     overwrite_schema: bool,
     cancellation_token: Option<&CancellationToken>,
-    callback: GenericErrorCallback,
+    callback_state: *const c_void,
+    callback: GenericErrorWithStateCallback,
 ) {
+    // Raw pointers are not Send; the state is opaque to us and only handed back verbatim.
+    let callback_state = callback_state as usize;
     let save_mode = unsafe {
         match SaveMode::from_str((*mode).to_str()) {
             Ok(save_mode) => save_mode,
             Err(err) => {
                 callback(
+                    callback_state as *const c_void,
                     std::ptr::null_mut(),
                     DeltaTableError::new(
                         runtime.as_mut(),
@@ -1254,7 +1274,7 @@ pub extern "C" fn table_insert(
     ) {
         Ok(batches) => batches,
         Err(err) => unsafe {
-            callback(std::ptr::null(), err.into_raw());
+            callback(callback_state as *const c_void, std::ptr::null(), err.into_raw());
             return;
         },
     };
@@ -1263,7 +1283,7 @@ pub extern "C" fn table_insert(
         match record_batch_stream_plan(unsafe { runtime.as_mut() }, batch_stream) {
             Ok(plan) => plan,
             Err(err) => unsafe {
-                callback(std::ptr::null(), err.into_raw());
+                callback(callback_state as *const c_void, std::ptr::null(), err.into_raw());
                 return;
             },
         };
@@ -1297,16 +1317,47 @@ pub extern "C" fn table_insert(
             match mb.await {
                 Ok(updated) => {
                     tbl.table = updated;
+                    // The in-memory table state grows with every committed version (log-segment
+                    // entries, schema Arcs, arrow buffers) and is never compacted in place — a
+                    // long-lived writer retains memory linearly with commit count. Rebuilding
+                    // the state from storage collapses it to checkpoint + tail. Aligned with
+                    // the default checkpoint interval (100) so the reload lands right after a
+                    // checkpoint, where it is cheapest. Failure is non-fatal: the state we
+                    // already hold stays valid and the next interval retries.
+                    tbl.commits_since_state_refresh += 1;
+                    if tbl.commits_since_state_refresh >= 100 {
+                        tbl.commits_since_state_refresh = 0;
+                        // NOTE: DeltaTable::load()/update_state() are INCREMENTAL when state
+                        // already exists — they apply new versions on top of the accreted
+                        // state and free nothing. A genuine rebuild needs a fresh state from
+                        // checkpoint + tail; swap only on success so a transient storage
+                        // error cannot leave the handle stateless.
+                        let mut fresh = deltalake::DeltaTable::new(
+                            tbl.table.log_store(),
+                            tbl.table.config.clone(),
+                        );
+                        if fresh.load().await.is_ok() {
+                            tbl.table = fresh;
+                        }
+                    }
+                    // Commit processing (log read/write buffers, HTTP traffic, checkpoint
+                    // bursts every 100th version) frees large transient allocations that the
+                    // C allocator keeps cached, ratcheting RSS forever. Trim after EVERY
+                    // commit: it must not depend on this handle's lifetime — production
+                    // writers recycle engines every few dozen commits, which resets any
+                    // per-handle cadence before it fires. glibc-only no-op elsewhere; cost
+                    // is microseconds against a commit's storage round-trip.
+                    crate::runtime::release_retained_allocator_memory();
                     let _ = (&mut reader_released).await;
                     unsafe {
-                        callback(std::ptr::null(), std::ptr::null());
+                        callback(callback_state as *const c_void, std::ptr::null(), std::ptr::null());
                     }
                 }
                 Err(error) => {
                     let error = DeltaTableError::from_error(rt, error);
                     let _ = (&mut reader_released).await;
                     unsafe {
-                        callback(std::ptr::null(), error.into_raw());
+                        callback(callback_state as *const c_void, std::ptr::null(), error.into_raw());
                     }
                 }
             };
@@ -1316,7 +1367,7 @@ pub extern "C" fn table_insert(
             // dropped along with the write future and the reader will stop on its next send:
             drop(input_stream_plan.take());
             let _ = (&mut reader_released).await;
-            callback(std::ptr::null(), std::ptr::null())
+            callback(callback_state as *const c_void, std::ptr::null(), std::ptr::null())
         }
     );
 }
@@ -1706,7 +1757,7 @@ pub extern "C" fn table_add_constraints(
 
 impl RawDeltaTable {
     fn new(table: deltalake::DeltaTable) -> Self {
-        RawDeltaTable { table }
+        RawDeltaTable { table, commits_since_state_refresh: 0 }
     }
 }
 
